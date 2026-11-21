@@ -37,7 +37,7 @@
 #include <hurd/ports.h>
 
 char *p9_source;
-FILE *p9_conn_in, *p9_conn_out;
+int p9_conn_in_fd = -1, p9_conn_out_fd = -1;
 char *p9_user_name;
 uint32_t p9_uid = ~0;
 uid_t p9_nobody_uid;
@@ -470,8 +470,8 @@ establish_connection ()
   if (fd_dup < 0)
     error (1, errno, "fcntl(F_DUPFD_CLOEXEC)");
 
-  p9_conn_in = fdopen (fd, "r");
-  p9_conn_out = fdopen (fd_dup, "w");
+  p9_conn_in_fd = fd;
+  p9_conn_out_fd = fd_dup;
 }
 
 static void
