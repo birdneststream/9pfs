@@ -34,7 +34,7 @@
 extern char *p9_source;
 
 /* Our connection to a 9P server.  */
-extern FILE *p9_conn_in, *p9_conn_out;
+extern int p9_conn_in_fd, p9_conn_out_fd;
 
 /* If set (not NULL, not -1), always use this
    user on the remote end.  */
