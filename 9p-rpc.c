@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/uio.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <error.h>
@@ -54,6 +55,15 @@ struct p9_header
 
 _Static_assert (sizeof (struct p9_header) == 7,
                 "the 9P message header is 7 bytes");
+
+/* A blob segment that is sent straight out of the caller's memory
+   instead of being copied into the send buffer.  Registered by the
+   'D' format specifier, which must be the last field of the message.  */
+struct p9_send_borrow
+{
+  const void *ptr;
+  size_t len;
+};
 
 /* A heap buffer that grows on demand.  */
 struct p9_buffer
@@ -135,6 +145,55 @@ writen (int fd, const void *buf, size_t n)
         return EIO;
       p += nwritten;
       n -= nwritten;
+    }
+  return 0;
+}
+
+/* Write exactly PREFIX_LEN bytes from PREFIX followed by BORROW_LEN
+   bytes from BORROW to FD with a single writev, looping over partial
+   writes across both segments.  Return 0 on success, or an error code
+   on failure.  */
+static error_t
+writev_all (int fd, const void *prefix, size_t prefix_len,
+            const void *borrow, size_t borrow_len)
+{
+  size_t total = prefix_len + borrow_len;
+  size_t done = 0;
+
+  while (done < total)
+    {
+      struct iovec iov[2];
+      size_t off;
+      ssize_t nwritten;
+
+      /* Lay the two segments out so the next writev resumes at DONE.
+         A segment that is fully written shrinks to zero length.  */
+      if (done < prefix_len)
+        {
+          iov[0].iov_base = (char *) prefix + done;
+          iov[0].iov_len = prefix_len - done;
+          iov[1].iov_base = (void *) borrow;
+          iov[1].iov_len = borrow_len;
+        }
+      else
+        {
+          off = done - prefix_len;
+          iov[0].iov_base = NULL;
+          iov[0].iov_len = 0;
+          iov[1].iov_base = (char *) borrow + off;
+          iov[1].iov_len = borrow_len - off;
+        }
+
+      nwritten = writev (fd, iov, 2);
+      if (nwritten < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          return errno;
+        }
+      if (nwritten == 0)
+        return EIO;
+      done += nwritten;
     }
   return 0;
 }
@@ -277,6 +336,7 @@ p9_vserialized_size (const char *format, va_list ap)
         break;
 
       case 'd':
+      case 'D':
         size = va_arg (ap, uint32_t);
         total_size += 4;
         va_arg (ap, const char *);
@@ -321,9 +381,13 @@ p9_serialized_size (const char *format, ...)
 
 /* Serialize the message body described by FORMAT and *AP into BUF and
    return the position just past the last serialized byte.  The caller
-   has sized BUF to hold the whole body.  */
+   has sized BUF to hold the whole body.  A 'D' field is not copied
+   into BUF: it is recorded in *BORROW for the caller to write out
+   after the serialized prefix, so the returned position stops before
+   the borrowed blob.  */
 static unsigned char *
-p9_do_vsend (const char *format, va_list *ap, unsigned char *buf)
+p9_do_vsend (const char *format, va_list *ap, unsigned char *buf,
+             struct p9_send_borrow *borrow)
 {
   const char *f, *ptr, * const *arr;
   unsigned char *p = buf;
@@ -383,6 +447,21 @@ p9_do_vsend (const char *format, va_list *ap, unsigned char *buf)
         p += size;
         break;
 
+      case 'D':
+        size = va_arg (*ap, uint32_t);
+        ptr = va_arg (*ap, const char *);
+        if (p9_dump_exchanges)
+          fprintf (stderr, " %" PRIu32 " <data>", (uint32_t) size);
+        n4 = htole32 (size);
+        memcpy (p, &n4, 4);
+        p += 4;
+        /* The blob goes out with writev, not through the buffer, so
+           no field may follow it in the message.  */
+        assert_backtrace (f[1] == '\0');
+        borrow->ptr = ptr;
+        borrow->len = size;
+        break;
+
       case 's':
         ptr = va_arg (*ap, const char *);
         size = strlen (ptr);
@@ -430,6 +509,7 @@ p9_vsend (unsigned char type, uint16_t tag,
   struct p9_header *hdr;
   unsigned char *end;
   va_list aq;
+  struct p9_send_borrow borrow = { NULL, 0 };
 
   /* Count the number of bytes we will need.  */
   va_copy (aq, *ap);
@@ -446,17 +526,31 @@ p9_vsend (unsigned char type, uint16_t tag,
   if (err)
     goto out;
 
-  /* Serialize the whole message, header first, into the send buffer,
-     then write it out in one go.  */
+  /* Serialize the message, header first, into the send buffer.  A
+     borrowed blob is left out of the buffer and written straight from
+     the caller's memory, so the message goes out as one writev over
+     the prefix and the blob, in one syscall with no payload copy.
+     Either way the send buffer is kept at full message size, which
+     keeps the sizing and the dump checks uniform.  */
   hdr = (struct p9_header *) p9_send_buffer.buffer;
   hdr->size = htole32 (size);
   hdr->type = type;
   hdr->tag = htole16 (tag);
 
-  end = p9_do_vsend (format, ap, p9_send_buffer.buffer + sizeof *hdr);
-  assert_backtrace (end - p9_send_buffer.buffer == size);
+  end = p9_do_vsend (format, ap, p9_send_buffer.buffer + sizeof *hdr,
+                     &borrow);
 
-  err = writen (p9_conn_out_fd, p9_send_buffer.buffer, size);
+  if (borrow.ptr != NULL)
+    {
+      assert_backtrace (end - p9_send_buffer.buffer + borrow.len == size);
+      err = writev_all (p9_conn_out_fd, p9_send_buffer.buffer,
+                        end - p9_send_buffer.buffer, borrow.ptr, borrow.len);
+    }
+  else
+    {
+      assert_backtrace (end - p9_send_buffer.buffer == size);
+      err = writen (p9_conn_out_fd, p9_send_buffer.buffer, size);
+    }
 
  out:
   pthread_mutex_unlock (&write_mutex);
