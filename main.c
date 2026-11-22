@@ -20,6 +20,7 @@
 #define _GNU_SOURCE 1
 
 #include "9pfs.h"
+#include "9p-rpc.h"
 #include "io_S.h"
 #include "fsys_S.h"
 #include "fs_S.h"
@@ -579,6 +580,10 @@ main (int argc, char **argv)
   establish_connection ();
 
   p9_startup ();
+
+  /* Collect replies to fire-and-forget writes.  Must run after the
+     version negotiation, which is single threaded.  */
+  p9_start_bg_reader ();
 
   ports_manage_port_operations_multithread (p9_bucket,
                                             demuxer,

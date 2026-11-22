@@ -38,6 +38,9 @@ struct p9_response_interest
   uint32_t size;  /* this size was received, or 0 while not received */
   unsigned char type; /* this type was received */
   hurd_ihash_locp_t locp;
+  /* Set for a fire-and-forget request.  No thread waits on the
+     condition variable.  Whoever reads the reply consumes it.  */
+  int background;
 };
 
 /* The characters supported inside FORMAT are:
@@ -87,3 +90,20 @@ error_t p9_recv (struct p9_response_interest *interest,
 /* Register interest, send, receive.  */
 error_t p9_rpc (enum p9_message_type request_type,
                 const char *request_format, ...);
+
+/* Send a request the way p9_rpc does, but return without waiting for
+   the reply.  The reply is collected in the background.  Its outcome,
+   including errors, is only logged, never reported to the client.  */
+error_t p9_rpc_noreply (enum p9_message_type request_type,
+                        const char *request_format, ...);
+
+/* Wait until no fire-and-forget write is outstanding, or until the
+   connection is known to be dead.  */
+void p9_wait_bg_writes (void);
+
+/* Whether fire-and-forget requests can be sent right now.  When this
+   returns false, fall back to the synchronous path.  */
+int p9_bg_writes_usable (void);
+
+/* Start the background reader thread.  Call once at startup.  */
+void p9_start_bg_reader (void);
