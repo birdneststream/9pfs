@@ -58,6 +58,12 @@ S_io_map (struct protid *protid,
   if (!pager)
     {
       uint16_t n_qids;
+      /* Whether to open the pager fid for writing.  Only a mapping
+         that carries write access can lead to dirty pages, and the
+         server checks the fid user against the file at open time.
+         Read-only mappings get a read-only fid, which is the common
+         case and skips any write permission round trip.  */
+      int writable = !p9_readonly && (flags & O_WRITE);
 
       assert_backtrace (np->pager_fid == P9_NO_FID);
       if (protid->walk_fid == P9_NO_FID)
@@ -78,17 +84,37 @@ S_io_map (struct protid *protid,
       {
         struct p9_qid qid;
         uint32_t max_message_size;
+        unsigned char core_mode = writable ? 2 : 0;
+        uint32_t l_flags = writable ? 2 : 0;
 
         if (p9_version >= P9_VERSION_2000_L)
           err = p9_rpc (P9_LOPEN_REQUEST,
-                        "44", np->pager_fid, 0, /* Linux's O_RDONLY */
+                        "44", np->pager_fid, l_flags,
                         "1484", &qid.type, &qid.version, &qid.path,
                         &max_message_size);
         else
           err = p9_rpc (P9_OPEN_REQUEST,
-                        "41", np->pager_fid, 0, /* Plan 9 O_RDONLY */
+                        "41", np->pager_fid, core_mode,
                         "1484", &qid.type, &qid.version, &qid.path,
                         &max_message_size);
+        if (err && writable
+            && (err == EACCES || err == EPERM))
+          {
+            /* The server refuses write access to this user.  Retry
+               read-only rather than fail the mapping, and let the
+               write half of the map be refused below.  */
+            writable = 0;
+            if (p9_version >= P9_VERSION_2000_L)
+              err = p9_rpc (P9_LOPEN_REQUEST,
+                            "44", np->pager_fid, 0,
+                            "1484", &qid.type, &qid.version, &qid.path,
+                            &max_message_size);
+            else
+              err = p9_rpc (P9_OPEN_REQUEST,
+                            "41", np->pager_fid, 0,
+                            "1484", &qid.type, &qid.version, &qid.path,
+                            &max_message_size);
+          }
         if (err)
           {
             p9_rpc (P9_CLUNK_REQUEST,
@@ -119,13 +145,68 @@ S_io_map (struct protid *protid,
       ports_port_ref_weak (pager);
       p9_nref (np);
       np->pager = pager;
+      np->pager_writable = writable;
+    }
+  else if ((flags & O_WRITE) && !np->pager_writable && !p9_readonly)
+    {
+      /* The pager exists with a read-only fid, opened by an earlier
+         read-only mapping, and this mapping wants write access.
+         Walk a fresh fid from this protid, so the server checks the
+         writing user, open it read-write, then swap it in.
+
+         The old fid is deliberately left open rather than clunked.
+         A pager callback thread may hold the old fid number across
+         an in flight T-read, and a clunk that lands first would fail
+         that read and error the page.  The leaked fid stays valid
+         for the life of the connection, and this upgrade happens at
+         most once per pager.  */
+      uint32_t new_fid = p9_fid_alloc ();
+      uint16_t n_qids;
+
+      err = p9_rpc (P9_WALK_REQUEST,
+                    "442", protid->walk_fid, new_fid, 0,
+                    "2", &n_qids);
+      if (!err)
+        {
+          struct p9_qid qid;
+          uint32_t max_message_size;
+
+          if (p9_version >= P9_VERSION_2000_L)
+            err = p9_rpc (P9_LOPEN_REQUEST,
+                          "44", new_fid, 2,
+                          "1484", &qid.type, &qid.version, &qid.path,
+                          &max_message_size);
+          else
+            err = p9_rpc (P9_OPEN_REQUEST,
+                          "41", new_fid, 2,
+                          "1484", &qid.type, &qid.version, &qid.path,
+                          &max_message_size);
+        }
+      if (err)
+        {
+          p9_rpc (P9_CLUNK_REQUEST,
+                  "4", new_fid, "");
+          pthread_mutex_unlock (&np->lock);
+          return err;
+        }
+
+      /* Plain aligned word stores.  Callbacks running without the
+         node lock see either fid, and both remain valid on the
+         server.  No write back can race the swap, since pages were
+         supplied read-only until now.  */
+      np->pager_fid = new_fid;
+      np->pager_writable = 1;
     }
 
+  /* Hand out the write half of the map only when the pager fid can
+     carry the writes back.  A null write object makes the client mmap
+     fail with EACCES, which is the honest answer when the server
+     refused write access to the pager fid.  */
   switch (flags)
     {
     case O_RDWR:
       /* Call pager_get_port twice to account for two make-sends.  */
-      *wrobj = pager_get_port (pager);
+      *wrobj = np->pager_writable ? pager_get_port (pager) : MACH_PORT_NULL;
       *rdobj = pager_get_port (pager);
       *rdtype = *wrtype = MACH_MSG_TYPE_MAKE_SEND;
       break;
@@ -137,7 +218,7 @@ S_io_map (struct protid *protid,
     case O_WRITE:
       /* We'll return null in *rdport, but that's mostly informative,
          it doesn't really prevent the client from reading.  */
-      *wrobj = pager_get_port (pager);
+      *wrobj = np->pager_writable ? pager_get_port (pager) : MACH_PORT_NULL;
       *rdobj = MACH_PORT_NULL;
       *rdtype = *wrtype = MACH_MSG_TYPE_MAKE_SEND;
       break;
