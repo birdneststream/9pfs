@@ -57,7 +57,12 @@ struct p9_response_interest
    recv, into which the string buffer is malloced.  Data blobs are passed
    as a uint32_t size + buffer ptr on send and uint32_t *size + buffer ptr
    on recv; it's an error if more data is received than *size, and *size is
-   updated to reflect the amount actually received.  An array of strings is
+   updated to reflect the amount actually received.  A borrowed blob 'D'
+   is passed like a data blob on send, but its bytes are never copied
+   into the send buffer: the 4-byte size is serialized, then the blob is
+   written straight from the caller's memory with writev.  The caller
+   must keep the blob alive until p9_send returns, and 'D' must be the
+   last field of the format.  An array of strings is
    passed in as (const char * const *) and should be null-terminated; the
    strings themselves can be either null-terminated or '/'-terminated.  An
    array of qids is passed in as uint16_t *count, struct p9_qid **qbuf, and
