@@ -19,6 +19,7 @@
 
 #define _GNU_SOURCE 1
 #include "9pfs.h"
+#include "9p-rpc.h"
 #include "fsys_S.h"
 #include <stdlib.h>
 #include <errno.h>
@@ -29,6 +30,10 @@ S_fsys_goaway (struct port_info *control,
 {
   if (control != p9_control)
     return EOPNOTSUPP;
+
+  /* This is the shutdown path.  Give fire-and-forget writes a chance
+     to be confirmed before the connection goes away.  */
+  p9_wait_bg_writes ();
 
   /* TODO: fsys_goaway_reply ().  */
   /* TODO: Maybe close all fids.  */

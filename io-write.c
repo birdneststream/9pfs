@@ -67,6 +67,37 @@ S_io_write (struct protid *protid,
   /* Preemptively invalidate the stat cache.  */
   np->last_stat = 0;
 
+  /* Write-behind for unsynced opens.  O_SYNC and O_DSYNC alias the
+     same bit on the Hurd, so one test covers both.  The flags arrive
+     with the open call and live in user_open_flags.  The
+     io_set_all_openmodes family keeps them current, since O_FSYNC is
+     one of the honored state modes.
+
+     With neither flag set, send the T-write and reply at once.  The
+     server's reply is collected in the background.  Error semantics
+     change only for this unsynced case, and that is the point of the
+     feature: a write that later fails at the server still reports
+     success here.  The failure is logged, and a following sync will
+     report errors on the connection.  */
+  if (!(po->user_open_flags & (O_SYNC | O_DSYNC))
+      && p9_bg_writes_usable ())
+    {
+      /* The payload is borrowed from the MIG request buffer.  The
+         borrow ends when the send call returns, which is still
+         inside this handler.  */
+      err = p9_rpc_noreply (P9_WRITE_REQUEST,
+                            "48D", protid->io_fid, start, datalen, data);
+      if (err)
+        goto out;
+
+      /* The real count comes back later.  Reply with what was
+         requested, which is what a successful write returns.  */
+      *amount = datalen;
+      if (offset == -1)
+        po->offset += datalen;
+      goto out;
+    }
+
   /* Send the data straight out of the MIG request buffer as a
      borrowed blob, saving a copy of the payload into the send buffer.
      The request buffer lives until this handler returns, and the

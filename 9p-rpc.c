@@ -30,6 +30,7 @@
 #include <sys/uio.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <error.h>
 #include <assert-backtrace.h>
 #include <hurd/ihash.h>
@@ -42,6 +43,46 @@ static int some_thread_is_reading = 0;
 static uint16_t next_tag = ~0;
 
 static pthread_mutex_t write_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Write-behind machinery.
+
+   S_io_write can send a T-write and return without waiting for the
+   server to confirm it.  Such a request is registered in the interest
+   table like any other, but no thread waits on its condition
+   variable.  The reply is collected by whoever reads it off the
+   connection: the background reader thread, or a foreground thread
+   that happens to be reading when the reply arrives.
+
+   Scope choice: the outstanding count and the drain condition are
+   global, not per node.  A sync on any file waits for every
+   outstanding background write in the whole filesystem.  That is the
+   simplest correct scope for a single shared 9P connection.  */
+/* Background write-behind state: the wakeup and drain conditions, the
+   outstanding write count, and the reader lifecycle flags.  */
+struct p9_background {
+  pthread_cond_t work_cond;
+  pthread_cond_t drain_cond;
+  uint32_t outstanding;
+  /* Set when the background reader dies, so the connection is broken.
+   * Atomic: every read and write of it is an explicit atomic, several
+   * of them outside the mutex, see p9_bg_writes_usable and
+   * p9_rpc_noreply.  */
+  atomic_int dead;
+  int reader_started;
+};
+
+static struct p9_background bg = {
+  .work_cond = PTHREAD_COND_INITIALIZER,
+  .drain_cond = PTHREAD_COND_INITIALIZER,
+  .dead = 0,
+};
+
+/* Cap on unacknowledged fire-and-forget writes.  Bounds the interest
+   table and the tags one writer can hold.  At the cap the sender
+   waits for replies to arrive first.  */
+#define P9_BG_MAX_OUTSTANDING 128
+
+static void p9_collect_bg_reply (struct p9_response_interest *interest);
 
 /* The header at the front of every 9P message: a 4-byte
    little-endian size counting the whole message including the
@@ -219,6 +260,17 @@ p9_grow_buffer (struct p9_buffer *buf, size_t need)
   return 0;
 }
 
+/* Decode a message header into its fields, converting from
+   little-endian.  */
+static void
+p9_decode_header (const struct p9_header *header,
+                  uint32_t *size, unsigned char *type, uint16_t *tag)
+{
+  *size = le32toh (header->size);
+  *type = header->type;
+  *tag = le16toh (header->tag);
+}
+
 static error_t
 wait_for_header (struct p9_response_interest *interest)
 {
@@ -268,9 +320,7 @@ wait_for_header (struct p9_response_interest *interest)
   if (err)
     goto out;
 
-  size = le32toh (header.size);
-  type = header.type;
-  tag = le16toh (header.tag);
+  p9_decode_header (&header, &size, &type, &tag);
 
   pthread_mutex_lock (&mutex);
 
@@ -288,8 +338,21 @@ wait_for_header (struct p9_response_interest *interest)
       // TODO: unexpected message, but we still have to read it.
       assert_backtrace (0);
     }
-  /* Fill in the other interest with the header we've read.  */
   assert_backtrace (other_interest->tag == tag);
+  if (other_interest->background)
+    {
+      /* No thread waits on this reply, so signalling it would be
+         lost.  We hold the reading token, so consume the message
+         right here, then go back to waiting for our own header.  */
+      other_interest->size = size;
+      other_interest->type = type;
+      hurd_ihash_locp_remove (&interest_table, other_interest->locp);
+      pthread_mutex_unlock (&mutex);
+      p9_collect_bg_reply (other_interest);
+      pthread_mutex_lock (&mutex);
+      goto again;
+    }
+  /* Fill in the other interest with the header we've read.  */
   other_interest->size = size;
   other_interest->type = type;
   /* Wake it up, and wait for it to figure everything out.
@@ -613,6 +676,11 @@ p9_finish_message (struct p9_response_interest *interest,
 
   pthread_mutex_lock (&mutex);
   some_thread_is_reading = 0;
+  /* Let the background reader recheck whether it should be reading.
+     Waking it with nothing outstanding is harmless, it goes back to
+     sleep.  */
+  if (bg.outstanding)
+    pthread_cond_signal (&bg.work_cond);
   /* If there are threads waiting, wake somebody up.  */
   HURD_IHASH_ITERATE (&interest_table, value)
     {
@@ -980,5 +1048,271 @@ p9_rpc (enum p9_message_type request_type,
   pthread_cond_destroy (&interest.cond);
  out:
   va_end (ap);
+  return err;
+}
+
+/* Like p9_recv, but for a message whose header has already been
+   read.  Used to consume collected background replies.  */
+static error_t
+p9_recv_collected (struct p9_response_interest *interest,
+                   enum p9_message_type request_type,
+                   const char *fmt, ...)
+{
+  error_t err;
+  va_list ap;
+
+  va_start (ap, fmt);
+  err = p9_do_vrecv (interest, request_type, fmt, ap);
+  va_end (ap);
+
+  return err;
+}
+
+/* Collect the reply to a fire-and-forget write.  The interest is
+   already unregistered and its header fields are filled in.  The
+   caller holds the reading token.  Reading the body releases the
+   token again.  Errors are logged, never reported to the client,
+   since the client was already told the write succeeded.  */
+static void
+p9_collect_bg_reply (struct p9_response_interest *interest)
+{
+  error_t err;
+  uint32_t count = 0;
+
+  err = p9_recv_collected (interest, P9_WRITE_REQUEST, "4", &count);
+  if (err)
+    error (0, err, "background write failed");
+
+  pthread_cond_destroy (&interest->cond);
+  free (interest);
+
+  pthread_mutex_lock (&mutex);
+  assert_backtrace (bg.outstanding > 0);
+  bg.outstanding--;
+  pthread_cond_broadcast (&bg.drain_cond);
+  pthread_mutex_unlock (&mutex);
+}
+
+/* The background reader thread.  It exists so that replies to
+   fire-and-forget writes are collected even when no foreground
+   request is in flight.  It runs the same receive discipline as the
+   foreground path: take the reading token, read a header, then either
+   consume a background reply itself, or hand a foreground reply to
+   its waiter and pass the token along.  */
+static void *
+p9_bg_reader (void *unused)
+{
+  error_t err = 0;
+  struct p9_header header;
+  uint32_t size;
+  unsigned char type;
+  uint16_t tag;
+  struct p9_response_interest *interest;
+
+  (void) unused;
+
+  pthread_mutex_lock (&mutex);
+
+  while (1)
+    {
+      if (some_thread_is_reading || bg.outstanding == 0)
+        {
+          err = pthread_hurd_cond_wait_np (&bg.work_cond, &mutex);
+          if (err)
+            {
+              pthread_mutex_unlock (&mutex);
+              goto dead_notoken;
+            }
+          continue;
+        }
+
+      /* Nobody else is reading, so we will.  */
+      some_thread_is_reading = 1;
+      pthread_mutex_unlock (&mutex);
+
+      err = readn (p9_conn_in_fd, &header, sizeof (header));
+      if (err)
+        goto dead;
+
+      p9_decode_header (&header, &size, &type, &tag);
+
+      pthread_mutex_lock (&mutex);
+      interest = hurd_ihash_find (&interest_table, tag);
+      if (!interest)
+        {
+          /* Same reaction as the foreground path.  */
+          assert_backtrace (0);
+        }
+      assert_backtrace (interest->tag == tag);
+      if (interest->background)
+        {
+          /* This reply belongs to us.  Consume it, then keep the
+             token and read on.  */
+          interest->size = size;
+          interest->type = type;
+          hurd_ihash_locp_remove (&interest_table, interest->locp);
+          pthread_mutex_unlock (&mutex);
+          p9_collect_bg_reply (interest);
+          pthread_mutex_lock (&mutex);
+          continue;
+        }
+      /* A foreground reply.  Fill in the header, wake its waiter,
+         and pass the token to it, like wait_for_header does.  */
+      interest->size = size;
+      interest->type = type;
+      pthread_cond_signal (&interest->cond);
+      /* The token stays taken, so the loop goes back to sleep.  */
+    }
+
+ dead:
+  /* We held the reading token when the connection failed, so give it
+     back first.  */
+  pthread_mutex_lock (&mutex);
+  some_thread_is_reading = 0;
+  pthread_mutex_unlock (&mutex);
+ dead_notoken:
+  /* Outstanding background writes will never be answered, so stop
+     counting them and let sync callers through.  Foreground requests
+     fail on their own from here on.  Their interests stay registered
+     in the table.  The connection is dead either way.  */
+  pthread_mutex_lock (&mutex);
+  atomic_store_explicit (&bg.dead, 1, memory_order_release);
+  bg.outstanding = 0;
+  pthread_cond_broadcast (&bg.drain_cond);
+  pthread_cond_broadcast (&bg.work_cond);
+  pthread_mutex_unlock (&mutex);
+
+  error (0, err, "9P background reader");
+
+  return NULL;
+}
+
+void
+p9_start_bg_reader (void)
+{
+  error_t err;
+  pthread_t thread;
+
+  pthread_mutex_lock (&mutex);
+  if (bg.reader_started)
+    {
+      pthread_mutex_unlock (&mutex);
+      return;
+    }
+  bg.reader_started = 1;
+  pthread_mutex_unlock (&mutex);
+
+  err = pthread_create (&thread, NULL, p9_bg_reader, NULL);
+  if (err)
+    {
+      error (0, err, "pthread_create of the background reader failed,"
+             " writes stay synchronous");
+      /* Mark the machinery dead so writes take the synchronous path.
+         The release store is atomic, and the lock guards no other
+         state here: reader_started was settled under it above.  */
+      atomic_store_explicit (&bg.dead, 1, memory_order_release);
+      return;
+    }
+  pthread_detach (thread);
+}
+
+int
+p9_bg_writes_usable (void)
+{
+  /* Lock free: this is called on every write, the release store from
+   * the dying reader pairs with the acquire load here.  */
+  return !atomic_load_explicit (&bg.dead, memory_order_acquire);
+}
+
+void
+p9_wait_bg_writes (void)
+{
+  pthread_mutex_lock (&mutex);
+  /* bg.outstanding belongs to the mutex, bg.dead is atomic on its
+     own, also inside the lock.  */
+  while (bg.outstanding > 0
+         && !atomic_load_explicit (&bg.dead, memory_order_acquire))
+    pthread_hurd_cond_wait_np (&bg.drain_cond, &mutex);
+  pthread_mutex_unlock (&mutex);
+}
+
+/* Send a request and return without waiting for its reply.  The
+   reply is collected and freed by the background machinery whenever
+   it arrives.  Used for writes whose errors the caller has chosen
+   not to report, see S_io_write.  */
+error_t
+p9_rpc_noreply (enum p9_message_type request_type,
+                const char *request_format, ...)
+{
+  error_t err;
+  va_list ap;
+  struct p9_response_interest *interest;
+
+  interest = calloc (1, sizeof (*interest));
+  if (!interest)
+    return errno;
+
+  pthread_cond_init (&interest->cond, NULL);
+  interest->background = 1;
+
+  if (atomic_load_explicit (&bg.dead, memory_order_acquire))
+    {
+      err = EIO;
+      goto out_free;
+    }
+  pthread_mutex_lock (&mutex);
+  while (bg.outstanding >= P9_BG_MAX_OUTSTANDING
+         && !atomic_load_explicit (&bg.dead, memory_order_acquire))
+    pthread_hurd_cond_wait_np (&bg.drain_cond, &mutex);
+  pthread_mutex_unlock (&mutex);
+  if (atomic_load_explicit (&bg.dead, memory_order_acquire))
+    {
+      err = EIO;
+      goto out_free;
+    }
+
+  err = p9_register_interest (interest);
+  if (err)
+    goto out_free;
+
+  /* Count the write before sending it.  This way the reader can
+     never collect a reply while the count is still zero.  */
+  pthread_mutex_lock (&mutex);
+  if (atomic_load_explicit (&bg.dead, memory_order_acquire))
+    {
+      /* The connection died while we registered the interest, so
+         take it back out under the same lock before freeing it.  */
+      hurd_ihash_locp_remove (&interest_table, interest->locp);
+      pthread_mutex_unlock (&mutex);
+      err = EIO;
+      goto out_free;
+    }
+  bg.outstanding++;
+  pthread_cond_signal (&bg.work_cond);
+  pthread_mutex_unlock (&mutex);
+
+  va_start (ap, request_format);
+  err = p9_vsend (request_type, interest->tag,
+                  request_format, &ap);
+  va_end (ap);
+
+  if (err)
+    {
+      /* Nothing was sent, so no reply will ever arrive.  */
+      pthread_mutex_lock (&mutex);
+      assert_backtrace (bg.outstanding > 0);
+      bg.outstanding--;
+      pthread_cond_broadcast (&bg.drain_cond);
+      hurd_ihash_locp_remove (&interest_table, interest->locp);
+      pthread_mutex_unlock (&mutex);
+      goto out_free;
+    }
+
+  /* The reply is now the background machinery's problem.  */
+  return 0;
+
+ out_free:
+  pthread_cond_destroy (&interest->cond);
+  free (interest);
   return err;
 }
