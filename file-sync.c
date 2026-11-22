@@ -36,6 +36,13 @@ S_file_sync (struct protid *pi, int wait, int omit_metadata)
     /* Should we return EROFS?  */
     return 0;
 
+  /* Drain the write-behind queue first.  The outstanding count is
+     global, so this waits for every fire-and-forget write in the
+     filesystem, not just this file.  That is the scope choice made
+     in 9p-rpc.c.  Sending the sync request afterwards guarantees the
+     server sees the writes before the sync.  */
+  p9_wait_bg_writes ();
+
 
   if (p9_version >= P9_VERSION_2000_L)
     {
