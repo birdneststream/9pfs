@@ -67,8 +67,12 @@ S_io_write (struct protid *protid,
   /* Preemptively invalidate the stat cache.  */
   np->last_stat = 0;
 
+  /* Send the data straight out of the MIG request buffer as a
+     borrowed blob, saving a copy of the payload into the send buffer.
+     The request buffer lives until this handler returns, and the
+     writev completes before we return, so the borrow stays valid.  */
   err = p9_rpc (P9_WRITE_REQUEST,
-                "48d", protid->io_fid, start, datalen, data,
+                "48D", protid->io_fid, start, datalen, data,
                 "4", &nwritten);
   if (err)
     goto out;
