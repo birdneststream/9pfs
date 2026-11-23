@@ -38,9 +38,9 @@ LIBS = shouldbeinlibc ihash ports iohelp fshelp pager
 		-server $*Server.c -sheader $*_S.h \
 		/dev/stdin
 	@if [ "$*" = io ]; then \
-	  grep -qF 'OutP->dataType.msgtl_header.msgt_deallocate = TRUE;' $*Server.c \
-	    || { echo "io_read reply no longer sets deallocate; review the reply cache" >&2; exit 1; }; \
-	  sed -i 's/OutP->dataType.msgtl_header.msgtl_deallocate = TRUE;/OutP->dataType.msgtl_header.msgtl_deallocate = FALSE;/' $*Server.c; \
+	  sed -i 's/OutP->dataType.msgtl_header.msgt_deallocate = TRUE;/OutP->dataType.msgtl_header.msgt_deallocate = FALSE;/' $*Server.c; \
+	  grep -qF 'OutP->dataType.msgtl_header.msgt_deallocate = FALSE;' $*Server.c \
+	    || { echo "io_read reply descriptor not rewritten to the copying form; review the reply cache" >&2; exit 1; }; \
 	fi
 
 clean:
